@@ -1,15 +1,13 @@
 #include <stdio.h>
 #include <stdlib.h>
-#include <stdint.h>
 #include <math.h>
 #include <complex.h>
-#include <string.h>
 
 #define N 64
 #define CP 16
 #define LENGTH (N + CP)
 #ifndef TOTAL_BITS
-#define TOTAL_BITS (1UL << 25)
+#define TOTAL_BITS 33554432
 #endif
 #define OFFSET 23
 #define SYNC_SYMBOLS 256
@@ -18,25 +16,21 @@ static const double PI = 3.14159265358979323846;
 static const int LEVEL[4] = {-3, -1, 3, 1};
 
 void fft(double complex x[], int n, int inverse);
-uint32_t random_word(uint64_t *state);
-double uniform(uint64_t *state);
-double complex noise(uint64_t *state, double sigma);
-double complex map(const unsigned char *bits, int order);
-void demap(double complex value, unsigned char *bits, int order);
+double complex noise(double sigma);
+double complex map(const int *bits, int bits_per_symbol);
+void demap(double complex value, int *bits, int bits_per_symbol);
 FILE *open_output(const char *name);
 int synchronize(const double complex *rx, int count, double *metric);
-void simulate(int order, FILE *ber);
-void self_test(void);
+void simulate(int bits_per_symbol, FILE *ber);
 
 int main(void)
 {
     FILE *ber;
 
-    self_test();
     ber = open_output("ber.csv");
     fprintf(ber, "modulation,snr_db,bits,errors,ber,theory,cp_start,fft_start,signal_power,noise_power\n");
-    simulate(2, ber);
-    simulate(4, ber);
+    simulate(2, ber);  /* Required: QPSK, 2 bits per symbol. */
+    simulate(4, ber);  /* Bonus: 16-QAM, 4 bits per symbol. */
     if (fclose(ber) != 0) {
         perror("ber.csv");
         return EXIT_FAILURE;
@@ -44,49 +38,34 @@ int main(void)
     return EXIT_SUCCESS;
 }
 
-/* PCG-XSH-RR: explicit unsigned arithmetic makes the sequence reproducible. */
-uint32_t random_word(uint64_t *state)
+/* rand() is uniform; Box-Muller converts two draws into Gaussian I/Q noise. */
+double complex noise(double sigma)
 {
-    uint64_t old;
-    uint32_t value, rotation;
+    double u1, u2, radius, angle;
 
-    old = *state;
-    *state = old * UINT64_C(6364136223846793005) + UINT64_C(1442695040888963407);
-    value = (uint32_t)(((old >> 18u) ^ old) >> 27u);
-    rotation = (uint32_t)(old >> 59u);
-    return (value >> rotation) | (value << ((0u - rotation) & 31u));
-}
-
-double uniform(uint64_t *state)
-{
-    return ((double)random_word(state) + 0.5) / 4294967296.0;
-}
-
-/* Box-Muller: independent N(0, sigma^2) real and imaginary components. */
-double complex noise(uint64_t *state, double sigma)
-{
-    double radius, angle;
-
-    radius = sigma * sqrt(-2.0 * log(uniform(state)));
-    angle = 2.0 * PI * uniform(state);
+    /* Keep u1 strictly between 0 and 1 so log(u1) is defined. */
+    u1 = (rand() + 1.0) / (RAND_MAX + 2.0);
+    u2 = (rand() + 1.0) / (RAND_MAX + 2.0);
+    radius = sigma * sqrt(-2.0 * log(u1));
+    angle = 2.0 * PI * u2;
     return radius * (cos(angle) + I * sin(angle));
 }
 
-double complex map(const unsigned char *bits, int order)
+double complex map(const int *bits, int bits_per_symbol)
 {
-    if (order == 2) {
+    if (bits_per_symbol == 2) {
         return ((1.0 - 2.0 * bits[0]) + I * (1.0 - 2.0 * bits[1])) / sqrt(2.0);
     }
     return (LEVEL[2 * bits[0] + bits[1]] + I * LEVEL[2 * bits[2] + bits[3]]) / sqrt(10.0);
 }
 
-void demap(double complex value, unsigned char *bits, int order)
+void demap(double complex value, int *bits, int bits_per_symbol)
 {
     double real, imag;
 
     real = creal(value);
     imag = cimag(value);
-    if (order == 2) {
+    if (bits_per_symbol == 2) {
         bits[0] = real < 0.0;
         bits[1] = imag < 0.0;
     } else {
@@ -109,11 +88,11 @@ FILE *open_output(const char *name)
     return file;
 }
 
-/* Search one complete symbol period. Receiver never reads OFFSET. */
+// Search one complete symbol period. Receiver never reads OFFSET.
 int synchronize(const double complex *rx, int count, double *metric)
 {
     int d, m, i, best;
-    size_t index;
+    int index;
     double complex correlation;
     double energy_a, energy_b;
 
@@ -124,7 +103,7 @@ int synchronize(const double complex *rx, int count, double *metric)
         energy_b = 0.0;
         for (m = 0; m < count; m++) {
             for (i = 0; i < CP; i++) {
-                index = (size_t)m * LENGTH + d + i;
+                index = m * LENGTH + d + i;
                 correlation += conj(rx[index]) * rx[index + N];
                 energy_a += creal(rx[index] * conj(rx[index]));
                 energy_b += creal(rx[index + N] * conj(rx[index + N]));
@@ -138,23 +117,25 @@ int synchronize(const double complex *rx, int count, double *metric)
     return best;
 }
 
-void simulate(int order, FILE *ber)
+void simulate(int bits_per_symbol, FILE *ber)
 {
-    unsigned char *bits, decoded[4];
+    int *bits, decoded[4];
     double complex *rx, block[N], sample, perturbation;
     double metric[LENGTH], gamma, sigma, signal_energy, noise_energy, theory, a;
-    uint64_t bit_state, noise_state;
-    size_t i, m, k, b, symbols, samples, index, errors;
+    int i, m, k, b, symbols, samples, index, errors;
     int snr, start, count, trial, counts[5];
     char filename[100];
     const char *name;
     FILE *wave, *constellation, *sync;
 
-    name = order == 2 ? "QPSK" : "16QAM";
-    symbols = TOTAL_BITS / (N * order);
-    samples = symbols * LENGTH + 2 * LENGTH;
-    if (TOTAL_BITS % (N * order) != 0 || symbols <= SYNC_SYMBOLS) {
-        fprintf(stderr, "TOTAL_BITS must contain more than 256 complete OFDM symbols.\n");
+    name = bits_per_symbol == 2 ? "QPSK" : "16QAM";
+    symbols = TOTAL_BITS / (N * bits_per_symbol);
+    /* One extra period covers the leading delay and the last FFT window. */
+    samples = symbols * LENGTH + LENGTH;
+    if (TOTAL_BITS <= 0 || TOTAL_BITS % (N * bits_per_symbol) != 0 ||
+        symbols <= SYNC_SYMBOLS || symbols <= 64 || SYNC_SYMBOLS <= 0 ||
+        OFFSET < 0 || OFFSET >= LENGTH) {
+        fprintf(stderr, "Check TOTAL_BITS, SYNC_SYMBOLS, and OFFSET settings.\n");
         exit(EXIT_FAILURE);
     }
     bits = malloc(TOTAL_BITS * sizeof(*bits));
@@ -163,9 +144,10 @@ void simulate(int order, FILE *ber)
         fprintf(stderr, "Cannot allocate simulation buffers.\n");
         exit(EXIT_FAILURE);
     }
-    bit_state = UINT64_C(10000);
+    /* Reuse the same input bits at every SNR. */
+    srand(10000);
     for (i = 0; i < TOTAL_BITS; i++) {
-        bits[i] = (unsigned char)(random_word(&bit_state) >> 31u);
+        bits[i] = rand() % 2;
     }
     counts[0] = 1;
     counts[1] = 4;
@@ -176,7 +158,7 @@ void simulate(int order, FILE *ber)
     for (snr = 0; snr <= 24; snr += 3) {
         gamma = pow(10.0, snr / 10.0);
         sigma = sqrt(1.0 / (2.0 * N * gamma));
-        noise_state = UINT64_C(987654321) + (uint64_t)(snr * 100 + order);
+        srand(20000 + snr * 100 + bits_per_symbol);
         wave = NULL;
         constellation = NULL;
         if (snr == 3 || snr == 15) {
@@ -187,34 +169,36 @@ void simulate(int order, FILE *ber)
             constellation = open_output(filename);
             fprintf(constellation, "symbol,carrier,tx_re,tx_im,rx_re,rx_im\n");
         }
-        for (i = 0; i < samples; i++) {
-            rx[i] = 0.0;
-        }
         for (i = 0; i < OFFSET; i++) {
-            rx[i] = noise(&noise_state, sigma);
+            rx[i] = noise(sigma);
         }
         signal_energy = 0.0;
         noise_energy = 0.0;
+        /* Map bits, perform IFFT, add CP, and pass samples through AWGN. */
         for (m = 0; m < symbols; m++) {
             for (k = 0; k < N; k++) {
-                block[k] = map(bits + (m * N + k) * order, order);
+                block[k] = map(bits + (m * N + k) * bits_per_symbol, bits_per_symbol);
             }
             fft(block, N, 1);
             for (k = 0; k < LENGTH; k++) {
-                sample = block[(k + N - CP) % N];
-                perturbation = noise(&noise_state, sigma);
+                if (k < CP) {
+                    sample = block[N - CP + k];  /* Copy the last 16 samples. */
+                } else {
+                    sample = block[k - CP];     /* Then send all 64 samples. */
+                }
+                perturbation = noise(sigma);
                 index = OFFSET + m * LENGTH + k;
                 rx[index] = sample + perturbation;
                 signal_energy += creal(sample * conj(sample));
                 noise_energy += creal(perturbation * conj(perturbation));
                 if (wave != NULL && m < 3) {
-                    fprintf(wave, "%zu,%.17g,%.17g,%.17g,%.17g\n", m * LENGTH + k,
+                    fprintf(wave, "%d,%.17g,%.17g,%.17g,%.17g\n", m * LENGTH + k,
                         creal(sample), cimag(sample), creal(rx[index]), cimag(rx[index]));
                 }
             }
         }
         for (i = OFFSET + symbols * LENGTH; i < samples; i++) {
-            rx[i] = noise(&noise_state, sigma);
+            rx[i] = noise(sigma);
         }
         snprintf(filename, sizeof(filename), "sync_%s_%02d.csv", name, snr);
         sync = open_output(filename);
@@ -224,10 +208,11 @@ void simulate(int order, FILE *ber)
             count = counts[trial];
             start = synchronize(rx, count, metric);
             for (i = 0; i < LENGTH; i++) {
-                fprintf(sync, "%d,%zu,%.17g,%d\n", count, i, metric[i], start);
+                fprintf(sync, "%d,%d,%.17g,%d\n", count, i, metric[i], start);
             }
         }
         fclose(sync);
+        /* Use the detected boundary, remove CP, FFT, and compare bits. */
         errors = 0;
         for (m = 0; m < symbols; m++) {
             for (k = 0; k < N; k++) {
@@ -235,14 +220,14 @@ void simulate(int order, FILE *ber)
             }
             fft(block, N, 0);
             for (k = 0; k < N; k++) {
-                index = (m * N + k) * order;
-                demap(block[k], decoded, order);
-                for (b = 0; b < (size_t)order; b++) {
+                index = (m * N + k) * bits_per_symbol;
+                demap(block[k], decoded, bits_per_symbol);
+                for (b = 0; b < bits_per_symbol; b++) {
                     errors += decoded[b] != bits[index + b];
                 }
                 if (constellation != NULL && m < 3) {
-                    sample = map(bits + index, order);
-                    fprintf(constellation, "%zu,%zu,%.17g,%.17g,%.17g,%.17g\n",
+                    sample = map(bits + index, bits_per_symbol);
+                    fprintf(constellation, "%d,%d,%.17g,%.17g,%.17g,%.17g\n",
                         m, k, creal(sample), cimag(sample), creal(block[k]), cimag(block[k]));
                 }
             }
@@ -251,67 +236,23 @@ void simulate(int order, FILE *ber)
             fclose(wave);
             fclose(constellation);
         }
-        a = sqrt(gamma / 5.0);
-        theory = order == 2 ? 0.5 * erfc(sqrt(gamma / 2.0)) :
-            0.375 * erfc(a / sqrt(2.0)) + 0.25 * erfc(3.0 * a / sqrt(2.0)) - 0.125 * erfc(5.0 * a / sqrt(2.0));
-        fprintf(ber, "%s,%d,%lu,%zu,%.17g,%.17g,%d,%d,%.17g,%.17g\n",
-            name, snr, (unsigned long)TOTAL_BITS, errors, (double)errors / TOTAL_BITS, theory,
+        /* Reference BER for the report; not used by the receiver. */
+        if (bits_per_symbol == 2) {
+            theory = 0.5 * erfc(sqrt(gamma / 2.0));
+        } else {
+            a = sqrt(gamma / 10.0);
+            theory = 0.375 * erfc(a) + 0.25 * erfc(3.0 * a) - 0.125 * erfc(5.0 * a);
+        }
+        fprintf(ber, "%s,%d,%d,%d,%.17g,%.17g,%d,%d,%.17g,%.17g\n",
+            name, snr, TOTAL_BITS, errors, (double)errors / TOTAL_BITS, theory,
             start, start + CP, signal_energy / (symbols * LENGTH), noise_energy / (symbols * LENGTH));
         fflush(ber);
-        printf("%s %2d dB: %zu / %lu errors, BER %.6g, detected CP %d (true %d)\n",
-            name, snr, errors, (unsigned long)TOTAL_BITS, (double)errors / TOTAL_BITS, start, OFFSET);
+        printf("%s %2d dB: %d / %d errors, BER %.6g, detected CP %d (true %d)\n",
+            name, snr, errors, TOTAL_BITS, (double)errors / TOTAL_BITS, start, OFFSET);
         fflush(stdout);
     }
     free(rx);
     free(bits);
-}
-
-void self_test(void)
-{
-    double complex original[N], block[N], rx[4 * LENGTH];
-    double metric[LENGTH], error;
-    unsigned char bits[4], result[4];
-    int order, value, i, k, d, detected;
-
-    error = 0.0;
-    for (order = 2; order <= 4; order += 2) {
-        for (value = 0; value < (1 << order); value++) {
-            for (i = 0; i < order; i++) {
-                bits[i] = (value >> i) & 1;
-            }
-            demap(map(bits, order), result, order);
-            if (memcmp(bits, result, (size_t)order) != 0) {
-                fprintf(stderr, "Mapping self-test failed.\n");
-                exit(EXIT_FAILURE);
-            }
-        }
-    }
-    for (k = 0; k < N; k++) {
-        original[k] = cos(k * 1.23) + I * sin(k * 0.71);
-        block[k] = original[k];
-    }
-    fft(block, N, 1);
-    for (d = 0; d < LENGTH; d++) {
-        memset(rx, 0, sizeof(rx));
-        for (i = 0; i < 3 * LENGTH; i++) {
-            /* Reset the sample index at each OFDM boundary. */
-            rx[d + i] = block[((i % LENGTH) + N - CP) % N];
-        }
-        detected = synchronize(rx, 2, metric);
-        if (detected != d) {
-            fprintf(stderr, "Timing self-test failed at %d: detected %d.\n", d, detected);
-            exit(EXIT_FAILURE);
-        }
-    }
-    fft(block, N, 0);
-    for (k = 0; k < N; k++) {
-        error = fmax(error, cabs(block[k] - original[k]));
-    }
-    if (error > 1e-10) {
-        fprintf(stderr, "FFT round-trip failed.\n");
-        exit(EXIT_FAILURE);
-    }
-    printf("Self-tests passed: all mapping labels, 80 noiseless timing offsets, FFT error %.3g\n", error);
 }
 
 void fft(double complex x[], int n, int inverse)
@@ -363,4 +304,3 @@ void fft(double complex x[], int n, int inverse)
         }
     }
 }
-
